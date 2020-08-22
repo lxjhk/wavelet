@@ -9,6 +9,7 @@ import os
 import shutil
 import time
 import random
+import threading
 
 import torch
 import torch.nn as nn
@@ -23,10 +24,12 @@ from tqdm import tqdm
 import subprocess
 import xml.etree.ElementTree as ET
 import pdb
-import cuda_p2p
+
+from flops import *
+
+import torch.autograd.profiler as profiler
 
 from utils import Bar, Logger, AverageMeter, accuracy, mkdir_p, savefig
-
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -38,7 +41,7 @@ parser.add_argument('-d', '--dataset', default='cifar10', type=str)
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 # Optimization options
-parser.add_argument('--epochs', default=300, type=int, metavar='N',
+parser.add_argument('--epochs', default=1, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
@@ -89,7 +92,8 @@ state = {k: v for k, v in args._get_kwargs()}
 # Validate dataset
 assert args.dataset == 'cifar10' or args.dataset == 'cifar100', 'Dataset can only be cifar10 or cifar100.'
 # Use CUDA
-os.environ['CUDA_VISIBLE_DEVICES'] = "0, 1, 2, 3"
+# os.environ['CUDA_VISIBLE_DEVICES'] = "0, 1, 2, 3"
+
 use_cuda = torch.cuda.is_available()
 
 # Random seed
@@ -102,63 +106,42 @@ if use_cuda:
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 best_acc = 0  # best test accuracy
-import threading
-import time
 MB = 1024*1024
 
-def gpu_mem_print(e, t):
-    stats = {}
-    #init stats dictionary
-    for key in torch.cuda.memory_stats():
-        stats[key] = []
-    while not e.isSet():
-        time.sleep(t)
-        for key, value in torch.cuda.memory_stats().items():
-            stats[key].append(value/MB)
-    import pickle
-    with open("stats.pickle", "wb") as f:
-        pickle.dump(stats, f)
 
-def extract(elem, tag, drop_s):
-    text = elem.find(tag).text
-    if drop_s not in text: raise Exception(text)
-    text = text.replace(drop_s,"")
-    try:
-        return int(text)
-    except ValueError:
-        return float(text)
-
-def nvidia_info():
-    cmd = ['nvidia-smi', '-q', '-x']
-    return subprocess.check_output(cmd)
-
-def compute_usage_print(e, t):
-    stats = []
-    while not e.isSet():
-        time.sleep(t)
-        gpu_info = nvidia_info()
-        gpu = ET.fromstring(gpu_info).find("gpu")
-        util = gpu.find("utilization")
-        stats.append(extract(util, "gpu_util", "%"))
-    import pickle
-    with open("compute_usage.pickle", "wb") as f:
-        pickle.dump(stats, f)
+def stringfy_event(self):
+    return (
+        '{}|{}|{}|{}|{}'
+        '|{}|{}|{}|{}|{}'
+        '|{}|{}|{}|{}|{}'.format(
+            self.id,
+            self.node_id,
+            self.cpu_time_str,
+            self.cpu_interval.start,
+            self.cpu_interval.end,
+            str([child.id for child in self.cpu_children]),
+            self.cuda_time_str,
+            self.name,
+            self.thread,
+            str(self.input_shapes),
+            self.cpu_memory_usage,
+            self.cuda_memory_usage,
+            self.is_async,
+            self.is_remote,
+            self.kernels,
+        )
+    )
 
 def main():
     global best_acc
-    cuda_p2p.enablePeerAccess(2, 3)
+    # cuda_p2p.enablePeerAccess(2, 3)
     #a = torch.tensor(3).int().cuda('cuda:0')
     #b = torch.tensor(4).int().cuda('cuda:1')
     #cuda_p2p.add_test(a, b)
-    #print(a)
-    
-    #print(b)
     start_epoch = args.start_epoch  # start from epoch 0 or last checkpoint epoch
 
     if not os.path.isdir(args.checkpoint):
         mkdir_p(args.checkpoint)
-
-
 
     # Data
     print('==> Preparing dataset %s' % args.dataset)
@@ -221,13 +204,13 @@ def main():
     else:
         model = models.__dict__[args.arch](num_classes=num_classes)
 
-    #model = torch.nn.DataParallel(model).cuda()
-    model = model.cuda("cuda:2")
+    model = model.cuda("cuda:0")
+    
+
     print("Initialized linear weight: ", list(model.classifier.weight)[0][:10])
     print('    Total params: %.2fM' % (sum(p.numel() for p in model.parameters())/1000000.0))
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
-    #optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
     # Resume
     title = 'cifar-10-' + args.arch
@@ -246,7 +229,6 @@ def main():
         logger = Logger(os.path.join(args.checkpoint, 'log.txt'), title=title)
         logger.set_names(['Learning Rate', 'Train Loss', 'Valid Loss', 'Train Acc.', 'Valid Acc.'])
 
-
     if args.evaluate:
         print('\nEvaluation only')
         test_loss, test_acc = test(testloader, model, criterion, start_epoch, use_cuda)
@@ -255,28 +237,31 @@ def main():
 
     # Train and val
     for epoch in range(start_epoch, args.epochs):
-        adjust_learning_rate(optimizer, epoch)
+        with profiler.profile(profile_memory=True, record_shapes=True) as prof:
 
-        print('\nEpoch: [%d | %d] LR: %f' % (epoch + 1, args.epochs, state['lr']))
-        train_loss, train_acc = train(trainloader, model, criterion, optimizer, epoch, use_cuda)
-        test_loss, test_acc = test(testloader, model, criterion, epoch, use_cuda)
-        # append logger file
-        # logger.append([state['lr'], train_loss, test_loss, train_acc, test_acc])
+            adjust_learning_rate(optimizer, epoch)
 
-        # save model
-        is_best = test_acc > best_acc
-        best_acc = max(test_acc, best_acc)
-        print('Best acc:')
-        print(best_acc)
-        # save_checkpoint({
-        #         'epoch': epoch + 1,
-        #         'state_dict': model.state_dict(),
-        #         'acc': test_acc,
-        #         'best_acc': best_acc,
-        #         'optimizer' : optimizer.state_dict(),
-        #     }, is_best, checkpoint=args.checkpoint)
+            print('\nEpoch: [%d | %d] LR: %f' % (epoch + 1, args.epochs, state['lr']))
+            train_loss, train_acc = train(trainloader, model, criterion, optimizer, epoch, use_cuda)
+            test_loss, test_acc = test(testloader, model, criterion, epoch, use_cuda)
+            # append logger file
+            # logger.append([state['lr'], train_loss, test_loss, train_acc, test_acc])
 
-    
+            # save model
+            is_best = test_acc > best_acc
+            best_acc = max(test_acc, best_acc)
+            print('Best acc:')
+            print(best_acc)
+            # save_checkpoint({
+            #         'epoch': epoch + 1,
+            #         'state_dict': model.state_dict(),
+            #         'acc': test_acc,
+            #         'best_acc': best_acc,
+            #         'optimizer' : optimizer.state_dict(),
+            #     }, is_best, checkpoint=args.checkpoint)
+        # print("epoch profiling result\n", prof)
+        # for item in prof.function_events:
+        #     print(stringfy_event(item))
     # e.set()
     #e2.set()
     # th.join()
@@ -285,8 +270,6 @@ def main():
     logger.close()
     logger.plot()
     savefig(os.path.join(args.checkpoint, 'log.eps'))
-
-    
 
 def train(trainloader, model, criterion, optimizer, epoch, use_cuda):
     # switch to train mode
@@ -301,18 +284,25 @@ def train(trainloader, model, criterion, optimizer, epoch, use_cuda):
 
     bar = Bar('Processing', max=len(trainloader))
     for batch_idx, (inputs, targets) in enumerate(trainloader):
-        cuda_p2p.cudaSync()
         # measure data loading time
         data_time.update(time.time() - end)
+
+        # with profiler.profile(profile_memory=True, record_shapes=True) as prof:
         if use_cuda:
             if batch_idx < len(trainloader) // 2:
-                inputs, targets = inputs.cuda("cuda:2"), targets.cuda("cuda:2", non_blocking=True)
+                inputs, targets = inputs.cuda("cuda:0"), targets.cuda("cuda:0", non_blocking=True)
             else:       
-                inputs, targets = inputs.cuda("cuda:2"), targets.cuda("cuda:2", non_blocking=True)
+                inputs, targets = inputs.cuda("cuda:0"), targets.cuda("cuda:0", non_blocking=True)
+        # print("data loading\n", prof)
+        # print("SUM",[ item for item in prof.function_events])
+
+        # with profiler.profile(profile_memory=True, record_shapes=True) as prof:
+        # print_model_param_flops(model=model, input_res=inputs)
+        outputs = model(inputs)
+
+        # print("backward\n", prof)
 
         # compute output
-        cuda_p2p.cudaSync()
-        outputs = model(inputs)
         loss = criterion(outputs, targets)
 
         # measure accuracy and record loss
@@ -322,17 +312,12 @@ def train(trainloader, model, criterion, optimizer, epoch, use_cuda):
         top5.update(prec5.item(), inputs.size(0))
 
         # compute gradient and do SGD step
-        cuda_p2p.cudaSync()
         optimizer.zero_grad()
 
         #pdb.set_trace()
 
-        cuda_p2p.cudaSync()
         loss.backward()
-        cuda_p2p.cudaSync()
-
         optimizer.step()
-        cuda_p2p.cudaSync()
         #print(list(model.classifier.weight)[0][:10])
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -373,12 +358,12 @@ def test(testloader, model, criterion, epoch, use_cuda):
         data_time.update(time.time() - end)
 
         if use_cuda:
-            inputs, targets = inputs.cuda("cuda:2"), targets.cuda("cuda:2")
-        inputs, targets = torch.autograd.Variable(inputs, volatile=True), torch.autograd.Variable(targets)
-
-        # compute output
-        outputs = model(inputs)
-        loss = criterion(outputs, targets)
+            inputs, targets = inputs.cuda("cuda:0"), targets.cuda("cuda:0")
+        # inputs, targets = torcha.autograd.Varible(inputs, volatile=True), torch.autograd.Variable(targets)
+        with torch.no_grad():
+            # compute output
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
 
         # measure accuracy and record loss
         prec1, prec5 = accuracy(outputs.data, targets.data, topk=(1, 5))
@@ -421,5 +406,3 @@ def adjust_learning_rate(optimizer, epoch):
 
 if __name__ == '__main__':
     main()
-
-

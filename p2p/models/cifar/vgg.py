@@ -30,16 +30,16 @@ class VGG(nn.Module):
         self._initialize_weights()
 
     def forward(self, x):
-        cuda_p2p.cudaSync()
+        # cuda_p2p.cudaSync()
         x = self.features(x)
         # print("conv ", x)
-        cuda_p2p.cudaSync()
+        # cuda_p2p.cudaSync()
         x = x.view(x.size(0), -1)
         # print("flatten ", x)
-        cuda_p2p.cudaSync()
+        # cuda_p2p.cudaSync()
         x = self.classifier(x)
         # print("linear ", x)
-        cuda_p2p.cudaSync()
+        # cuda_p2p.cudaSync()
         return x
 
     def _initialize_weights(self):

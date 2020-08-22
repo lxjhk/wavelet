@@ -308,8 +308,8 @@ def train(proc_ind,trainloader, model, criterion, use_cuda, device, e, args, tes
                 # print("GPU0 Getting")
                 # remote_pdb.set_trace()
                 for idx, param in enumerate(list(model.parameters())):
-                    id_number, uuid, grad = receiveQueue.get()
-                   print("\n--- GPU 0 received uuid", uuid, "grad", grad)
+                    id_number, grad = receiveQueue.get()
+                    print("\n--- GPU 0 received uuid", id_number,str(uuid.uuid4()), "grad", grad)
 
                     param.grad.data = grad.clone()
                 # print("GPU0 Received")
@@ -337,9 +337,8 @@ def train(proc_ind,trainloader, model, criterion, use_cuda, device, e, args, tes
                 # remote_pdb.set_trace()
                 # print("GPU0 Putting")
                 for idx, param in enumerate(list(model.parameters())):
-                    uuid = str(uuid.uuid4())
-                    print("\n--- GPU 0 put in uuid ", uuid, "grad", param.grad)
-                    sendQueue.put((idx, uuid, param.grad))
+                    print("\n--- GPU 0 put in uuid ", idx, str(uuid.uuid4()), "grad", param.grad)
+                    sendQueue.put((idx, param.grad))
                 print("--- current 0->1 queue size is ", sendQueue.qsize())
                 # print("GPU0 all reduce Share")
 
@@ -447,8 +446,8 @@ def train_copy(proc_ind, trainloader, model, criterion, use_cuda, device, e, arg
                 # remote_pdb.set_trace()
                 # print("GPU1 getting")
                 for idx, param in enumerate(list(model.parameters())):
-                    idx_number, uuid, grad = receiveQueue.get()
-                    print("\n--- GPU 1 received uuid", uuid, "grad", grad)
+                    idx_number, grad = receiveQueue.get()
+                    print("\n--- GPU 1 received uuid", idx_number, str(uuid.uuid4()), "grad", grad)
 
                     param.grad.data = grad.clone()
                 print("After receive, 0->1 queue size is ", receiveQueue.qsize())
@@ -467,9 +466,8 @@ def train_copy(proc_ind, trainloader, model, criterion, use_cuda, device, e, arg
                 # print("GPU1 putting")
                 # remote_pdb.set_trace()
                 for idx, param in enumerate(list(model.parameters())):
-                    uuid = str(uuid.uuid4())
-                    print("\n--- GPU 1 put in uuid ", uuid, "grad", param.grad)
-                    sendQueue.put((idx, uuid, param.grad))
+                    print("\n--- GPU 1 put in uuid ", idx, str(uuid.uuid4()), "grad", param.grad)
+                    sendQueue.put((idx, param.grad))
                 print("current 1->0 queue size is ", sendQueue.qsize())
                 # print("GPU1 all reduce Share")
 

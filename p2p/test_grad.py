@@ -29,6 +29,7 @@ import torch.cuda as cutorch
 from utils import Bar, Logger, AverageMeter, accuracy, mkdir_p, savefig
 import multiprocessing
 import torch.multiprocessing as mp
+from multiprocessing import shared_memory
 import threading
 import remote_pdb
 
@@ -50,7 +51,7 @@ parser.add_argument('--train-batch', default=128, type=int, metavar='N',
                     help='train batchsize')
 parser.add_argument('--test-batch', default=100, type=int, metavar='N',
                     help='test batchsize')
-parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
+parser.add_argument('--lr', '--learning-rate', default=0.05, type=float,
                     metavar='LR', help='initial learning rate')
 parser.add_argument('--drop', '--dropout', default=0, type=float,
                     metavar='Dropout', help='Dropout ratio')
@@ -97,6 +98,7 @@ os.environ['CUDA_VISIBLE_DEVICES'] = "0, 1, 2, 3"
 use_cuda = torch.cuda.is_available()
 
 # Random seed
+# make it deterministic - for res comp
 if args.manualSeed is None:
     args.manualSeed = random.randint(1, 10000)
 random.seed(args.manualSeed)
@@ -106,10 +108,10 @@ if use_cuda:
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 best_acc = 0  # best test accuracy
-valley_available = [False, False]
+
 import threading
 import time
-MB = 1024*1024
+
 gpu0 = 0
 gpu1 = 1
 world_size = 2
@@ -117,6 +119,8 @@ world_size = 2
 def main():
     global best_acc
     mp.set_start_method('spawn')
+
+    # create a lock
     e = mp.Event()
 
     if not os.path.isdir(args.checkpoint):
@@ -191,23 +195,10 @@ def main():
     print('    Total params: %.2fM' % (sum(p.numel() for p in model.parameters())/1000000.0))
     criterion = nn.CrossEntropyLoss()
 
-    # Resume
+    # # Resume
     title = 'cifar-10-' + args.arch
-    if args.resume:
-        # Load checkpoint.
-        print('==> Resuming from checkpoint..')
-        assert os.path.isfile(args.resume), 'Error: no checkpoint directory found!'
-        args.checkpoint = os.path.dirname(args.resume)
-        checkpoint = torch.load(args.resume)
-        best_acc = checkpoint['best_acc']
-        start_epoch = checkpoint['epoch']
-        model.load_state_dict(checkpoint['state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        logger = Logger(os.path.join(args.checkpoint, 'log.txt'), title=title, resume=True)
-    else:
-        logger = Logger(os.path.join(args.checkpoint, 'log.txt'), title=title)
-        logger.set_names(['Learning Rate', 'Train Loss', 'Valid Loss', 'Train Acc.', 'Valid Acc.'])
-
+    logger = Logger(os.path.join(args.checkpoint, 'log.txt'), title=title)
+    logger.set_names(['Learning Rate', 'Train Loss', 'Valid Loss', 'Train Acc.', 'Valid Acc.'])
 
     if args.evaluate:
         print('\nEvaluation only')
@@ -220,19 +211,9 @@ def main():
     save_model(model, 1)
     model0 = load_model(0)
     model1 = load_model(1)
-    queue01 = mp.Queue(21 * 1024 * 1024)
-    queue10 = mp.Queue(21 * 1024 * 1024)
 
-    # training
-    # manager = mp.Manager()
-    # Global = manager.Namespace()
-    # Global.model0_grad= list(model0.parameters())
-    # Global.model1_grad= list(model1.parameters())
-    # model0.share_memory()
-    # model1.share_memory()
-
-    train_gpu1 = mp.spawn(train_copy, args=(trainloader_gpu1, model1, criterion, use_cuda, gpu1, e, args, testloader, queue01, queue10), join=False)
-    train_gpu0 = mp.spawn(train, args=(trainloader_gpu0, model0, criterion, use_cuda, gpu0, e, args, testloader, queue10, queue01), join=False)
+    train_gpu1 = mp.spawn(train_copy, args=(trainloader_gpu1, model1, criterion, use_cuda, gpu1, e, args, testloader), join=False)
+    train_gpu0 = mp.spawn(train, args=(trainloader_gpu0, model0, criterion, use_cuda, gpu0, e, args, testloader), join=False)
     
     train_gpu1.join()
     train_gpu0.join()
@@ -241,9 +222,9 @@ def main():
     logger.plot()
     savefig(os.path.join(args.checkpoint, 'log.eps'))
 
-    
 
-def train(proc_ind,trainloader, model, criterion, use_cuda, device, e, args, testloader, receiveQueue, sendQueue):
+def train(proc_ind,trainloader, model, criterion, use_cuda, device, e, args, testloader):
+    dist.init_process_group(backend='nccl', init_method="file:///home/ubuntu/vgg/p2p/test_grad", world_size=2, rank=0)
     cuda_p2p.operatingGPUs(gpu0, gpu1)
     cuda_p2p.enablePeerAccess()
     print("\nTraining on device "+str(device)+" begins")
@@ -265,18 +246,11 @@ def train(proc_ind,trainloader, model, criterion, use_cuda, device, e, args, tes
             if use_cuda:
                 inputs_remote = inputs[:len(inputs)//2,:,:,:].cuda("cuda:" + str(gpu1))     
                 inputs_local = inputs[len(inputs)//2:,:,:,:].cuda(device_name)
-                targets = targets.cuda(device_name, non_blocking=True)
-                #targets = targets.cuda(device_name)
-            # compute output
-            # print("Running train")
+                targets = targets.cuda(device_name, non_blocking=True) # add data in, no wait on true
             cuda_p2p.cudaSync()
 
-            # Jason XiangJun ------------------------------------------------------
-            # outputs_remote = model(inputs_remote)
-            # outputs_local = model(inputs_local)
-            # ---------- original code above
-
-            outputs_remote_f, outputs_remote_res = work_warpper(lambda: model(inputs_remote))
+            #???
+            outputs_remote_f, outputs_remote_res = work_warpper(lambda: model(inputs_remote)) #o utput is on GPU 0? computation 是不是在 0 上？ 其实因该在 1 上
             outputs_local_f, outputs_local_res = work_warpper(lambda: model(inputs_local))
 
             from threading import Thread
@@ -287,10 +261,10 @@ def train(proc_ind,trainloader, model, criterion, use_cuda, device, e, args, tes
             t2.join()
             outputs_remote = outputs_remote_res()
             outputs_local = outputs_local_res()
-            # -----------------------------------------------------------------------
 
             outputs = torch.cat((outputs_remote, outputs_local),dim=0)
-            loss = criterion(outputs, targets)
+            loss = criterion(outputs, targets)  # GPU 0 evaluate
+
             # measure accuracy and record loss
             prec1, prec5 = accuracy(outputs.data, targets.data, topk=(1, 5))
             losses.update(loss.data.item(), inputs.size(0))
@@ -300,28 +274,22 @@ def train(proc_ind,trainloader, model, criterion, use_cuda, device, e, args, tes
             # compute gradient and do SGD step
             cuda_p2p.cudaSync()
             optimizer.zero_grad()
-            cuda_p2p.cudaSync()
 
-            # All Reduce 1, receiving model 1 grad
+            ## Learning other model grad
             if batch_idx >= 2:
-                # print("GPU0 Getting")
-                # remote_pdb.set_trace()
-                for idx, param in enumerate(list(model.parameters())):
-                    grad = receiveQueue.get()
-                    if idx == len(list(model.parameters())) - 1:
-                        print("\n GPU 0 received first layer grad: ", grad)
-                    param.grad.data = grad.clone()
-                # print("GPU0 Received")
-            #print("\nbatch_idx: ", batch_idx, model.classifier.weight.grad)
+                #print("\nGPU0 receive new Grad at batch ", batch_idx)
+                average_grad(model) # sync?????
+                #print("\nGPU0 receive new Grad at batch ", batch_idx, model.classifier.weight.grad)
+            
+            #print("\nBefore backward batch_idx: ", batch_idx, model.classifier.weight.grad)
             cuda_p2p.cudaSync()
             loss.backward()
-            #print("\nbatch_idx: ", batch_idx, model.classifier.weight.grad)
-            # all reduce /2 part
+            #print("\nAfter backward batch_idx: ", batch_idx, model.classifier.weight.grad)
             if batch_idx >= 2:
                 for param in model.parameters():
                     param.grad.data /= 2
             cuda_p2p.cudaSync()
-            #print("\nbatch_idx: ", batch_idx, model.classifier.weight.grad)
+            #print("\nAfter /2 batch_idx: ", batch_idx, model.classifier.weight.grad)
 
             # Run 1 loop first to warm up, then handshake for synced start
             if batch_idx == 1:
@@ -331,40 +299,30 @@ def train(proc_ind,trainloader, model, criterion, use_cuda, device, e, args, tes
                     pass
                 print("GPU0 receive")
 
-            # All Reduce 2, sharing model 0 grad
+            # Sending other model grad
             if batch_idx >= 1:
-                # remote_pdb.set_trace()
-                # print("GPU0 Putting")
-                for idx, param in enumerate(list(model.parameters())):
-                    if idx == len(list(model.parameters())) - 1:
-                        print("\n--- GPU 0 put in: ", param.grad.data)
-                    sendQueue.put(param.grad.data)
-                # print("GPU0 all reduce Share")
+                #print("\nGPU0 sending new Grad at batch ", batch_idx, model.classifier.weight.grad)
+                average_grad(model)
 
             cuda_p2p.cudaSync()
-
             optimizer.step()
-            cuda_p2p.cudaSync()
-            #if batch_idx > 1:
-                # print("GPU0 all_reduce")
-                #average_grad(model)
             cuda_p2p.cudaSync()
             # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
             #plot progress
-            # bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | top1: {top1: .4f} | top5: {top5: .4f}'.format(
-            #             batch=batch_idx + 1,
-            #             size=len(trainloader),
-            #             data=data_time.avg,
-            #             bt=batch_time.avg,
-            #             total=bar.elapsed_td,
-            #             eta=bar.eta_td,
-            #             loss=losses.avg,
-            #             top1=top1.avg,
-            #             top5=top5.avg,
-            #             )
-            # bar.next()
+            bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | top1: {top1: .4f} | top5: {top5: .4f}'.format(
+                        batch=batch_idx + 1,
+                        size=len(trainloader),
+                        data=data_time.avg,
+                        bt=batch_time.avg,
+                        total=bar.elapsed_td,
+                        eta=bar.eta_td,
+                        loss=losses.avg,
+                        top1=top1.avg,
+                        top5=top5.avg,
+                        )
+            bar.next()
         bar.finish()
 
         # validation
@@ -373,10 +331,10 @@ def train(proc_ind,trainloader, model, criterion, use_cuda, device, e, args, tes
 
     save_model(model, 0)
     print("\nTraining on device "+str(device)+" ends")
-    queue.close()
 
 
-def train_copy(proc_ind, trainloader, model, criterion, use_cuda, device, e, args, testloader, receiveQueue, sendQueue):
+def train_copy(proc_ind, trainloader, model, criterion, use_cuda, device, e, args, testloader):
+    dist.init_process_group(backend='nccl', init_method="file:///home/ubuntu/vgg/p2p/test_grad", world_size=2, rank=1)
     cuda_p2p.operatingGPUs(gpu0, gpu1)
     cuda_p2p.enablePeerAccess()
     print("\nTraining on device "+str(device)+" begins")
@@ -397,7 +355,6 @@ def train_copy(proc_ind, trainloader, model, criterion, use_cuda, device, e, arg
                 e.wait()
                 print("\nGPU1 caught signal, sending receival signal")
                 e.clear()
-                
             cuda_p2p.cudaSync()
             # measure data loading time
             data_time.update(time.time() - end)
@@ -405,19 +362,10 @@ def train_copy(proc_ind, trainloader, model, criterion, use_cuda, device, e, arg
                 inputs_remote = inputs[:len(inputs)//2,:,:,:].cuda("cuda:" + str(gpu0))     
                 inputs_local = inputs[len(inputs)//2:,:,:,:].cuda(device_name)
                 targets = targets.cuda(device_name, non_blocking=True)
-                #targets = targets.cuda(device_name)
             # compute output
-            # print("Running train_copy")
             cuda_p2p.cudaSync()
-            
-            # Jason XiangJun ------------------------------------------------------
-            # outputs_remote = model(inputs_remote)
-            # outputs_local = model(inputs_local)
-            # ---------- original code above
-
             outputs_remote_f, outputs_remote_res = work_warpper(lambda: model(inputs_remote))
             outputs_local_f, outputs_local_res = work_warpper(lambda: model(inputs_local))
-
             from threading import Thread
             t1, t2 = Thread(target=outputs_remote_f), Thread(target=outputs_local_f)
             t1.start()
@@ -426,10 +374,9 @@ def train_copy(proc_ind, trainloader, model, criterion, use_cuda, device, e, arg
             t2.join()
             outputs_remote = outputs_remote_res()
             outputs_local = outputs_local_res()
-            # -----------------------------------------------------------------------
 
             outputs = torch.cat((outputs_remote, outputs_local),dim=0)  ###outputs are always saved in the model gpu
-            loss = criterion(outputs, targets)
+            loss = criterion(outputs, targets) # update loss
             # measure accuracy and record loss
             prec1, prec5 = accuracy(outputs.data, targets.data, topk=(1, 5))
             losses.update(loss.data.item(), inputs.size(0))
@@ -438,39 +385,26 @@ def train_copy(proc_ind, trainloader, model, criterion, use_cuda, device, e, arg
             # compute gradient and do SGD step
             cuda_p2p.cudaSync()
             optimizer.zero_grad()
-            cuda_p2p.cudaSync()
-
-            # All Reduce 1, receiving model 0 grad
             if batch_idx >= 1:
-                # remote_pdb.set_trace()
-                # print("GPU1 getting")
-                for idx, param in enumerate(list(model.parameters())):
-                    grad = receiveQueue.get()
-                    if idx == len(list(model.parameters())) - 1:
-                        print("\n--- GPU 1 received: ", grad.data)
-                    param.grad.data = grad.clone()
-                # print("GPU1 Received")
-
+                average_grad(model) # sync 两边一定是 sync 的 等待???
+                #print("\nGPU1 receive new Grad at batch ", batch_idx, model.classifier.weight.grad)
             cuda_p2p.cudaSync()
-            loss.backward()
-            # all reduce /2 part
+            ## adding new grad before
+            cuda_p2p.cudaSync()
+            loss.backward() # (targets - input)
+            #print("GPU1 after backward grad batch_idx:", batch_idx, model.classifier.weight.grad)
+            cuda_p2p.cudaSync()
+
             if batch_idx >= 1:
                 for param in model.parameters():
                     param.grad.data /= 2
-            cuda_p2p.cudaSync()
-
-            # All Reduce 2, sharing model 1 grad
             if batch_idx >= 1:
-                # print("GPU1 putting")
-                # remote_pdb.set_trace()
-                for idx, param in enumerate(list(model.parameters())):
-                    if idx == len(list(model.parameters())) - 1:
-                        print("\nGPU 1 put in: ", param.grad.data)
-                    sendQueue.put(param.grad.data)
-                # print("GPU1 all reduce Share")
+                #print("\nGPU1 sending new Grad at batch ", batch_idx, model.classifier.weight.grad)
+                average_grad(model) # 对面 delta 是 0
+                # 402-404
 
             cuda_p2p.cudaSync()
-            optimizer.step()
+            optimizer.step() # gradient applies to my weight
             cuda_p2p.cudaSync()
 
             # measure elapsed time
@@ -478,18 +412,18 @@ def train_copy(proc_ind, trainloader, model, criterion, use_cuda, device, e, arg
             end = time.time()
 
             #plot progress
-            # bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | top1: {top1: .4f} | top5: {top5: .4f}'.format(
-            #             batch=batch_idx + 1,
-            #             size=len(trainloader),
-            #             data=data_time.avg,
-            #             bt=batch_time.avg,
-            #             total=bar.elapsed_td,
-            #             eta=bar.eta_td,
-            #             loss=losses.avg,
-            #             top1=top1.avg,
-            #             top5=top5.avg,
-            #             )
-            # bar.next()
+            bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | top1: {top1: .4f} | top5: {top5: .4f}'.format(
+                        batch=batch_idx + 1,
+                        size=len(trainloader),
+                        data=data_time.avg,
+                        bt=batch_time.avg,
+                        total=bar.elapsed_td,
+                        eta=bar.eta_td,
+                        loss=losses.avg,
+                        top1=top1.avg,
+                        top5=top5.avg,
+                        )
+            bar.next()
         bar.finish()
         
         # validation
@@ -498,7 +432,6 @@ def train_copy(proc_ind, trainloader, model, criterion, use_cuda, device, e, arg
 
     save_model(model, 1)
     print("\nTraining on device "+str(device)+" ends")
-    queue.close()
 
 def test(testloader, model, criterion, epoch, use_cuda, device):
     global best_acc
@@ -579,6 +512,12 @@ def cudaSync():
     torch.cuda.synchronize(gpu0)
     torch.cuda.synchronize(gpu1)
 
+def average_grad(model):
+    size = float(dist.get_world_size())
+    for param in model.parameters():
+        dist.all_reduce(param.grad.data)
+        #param.grad.data /= 4
+
 def work_warpper(k):
     """ Wraps a task into a callable object for multi-threading tasks with returned values """
     result = None 
@@ -589,6 +528,5 @@ def work_warpper(k):
         return result
     return work, res
 
-class 
 if __name__ == '__main__':
     main()

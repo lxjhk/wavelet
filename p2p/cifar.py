@@ -23,7 +23,6 @@ from tqdm import tqdm
 import subprocess
 import xml.etree.ElementTree as ET
 import pdb
-import cuda_p2p
 
 from utils import Bar, Logger, AverageMeter, accuracy, mkdir_p, savefig
 
@@ -40,7 +39,7 @@ parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
 # Optimization options
 parser.add_argument('--epochs', default=300, type=int, metavar='N',
                     help='number of total epochs to run')
-parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
+parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
 parser.add_argument('--train-batch', default=128, type=int, metavar='N',
                     help='train batchsize')
@@ -80,7 +79,7 @@ parser.add_argument('--manualSeed', type=int, help='manual seed')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
                     help='evaluate model on validation set')
 #Device options
-parser.add_argument('--gpu-id', default='1', type=str,
+parser.add_argument('--gpu-id', default='0', type=str,
                     help='id(s) for CUDA_VISIBLE_DEVICES')
 
 args = parser.parse_args()
@@ -89,8 +88,11 @@ state = {k: v for k, v in args._get_kwargs()}
 # Validate dataset
 assert args.dataset == 'cifar10' or args.dataset == 'cifar100', 'Dataset can only be cifar10 or cifar100.'
 # Use CUDA
-os.environ['CUDA_VISIBLE_DEVICES'] = "0, 1, 2, 3"
+os.environ['CUDA_VISIBLE_DEVICES'] = "0"
 use_cuda = torch.cuda.is_available()
+
+print("torch.cuda.is_available(): ", torch.cuda.is_available())
+torch.device('cuda:0')
 
 # Random seed
 if args.manualSeed is None:
@@ -105,6 +107,8 @@ best_acc = 0  # best test accuracy
 import threading
 import time
 MB = 1024*1024
+
+
 
 def gpu_mem_print(e, t):
     stats = {}
@@ -146,8 +150,8 @@ def compute_usage_print(e, t):
 
 def main():
     global best_acc
-    cuda_p2p.operatingGPUs(2, 3)
-    cuda_p2p.enablePeerAccess()
+    # cuda_p2p.operatingGPUs(0, 1)
+    # cuda_p2p.enablePeerAccess()
     #a = torch.tensor(3).int().cuda('cuda:0')
     #b = torch.tensor(4).int().cuda('cuda:1')
     #cuda_p2p.add_test(a, b)
@@ -158,7 +162,6 @@ def main():
 
     if not os.path.isdir(args.checkpoint):
         mkdir_p(args.checkpoint)
-
 
 
     # Data
@@ -223,7 +226,7 @@ def main():
         model = models.__dict__[args.arch](num_classes=num_classes)
 
     #model = torch.nn.DataParallel(model).cuda()
-    model = model.cuda("cuda:2")
+    model = model.cuda()
     print("Initialized linear weight: ", list(model.classifier.weight)[0][:10])
     print('    Total params: %.2fM' % (sum(p.numel() for p in model.parameters())/1000000.0))
     criterion = nn.CrossEntropyLoss()
@@ -302,18 +305,21 @@ def train(trainloader, model, criterion, optimizer, epoch, use_cuda):
 
     bar = Bar('Processing', max=len(trainloader))
     for batch_idx, (inputs, targets) in enumerate(trainloader):
-        cuda_p2p.cudaSync()
+        # cuda_p2p.cudaSync()
         # measure data loading time
         data_time.update(time.time() - end)
         if use_cuda:
             if batch_idx < len(trainloader) // 2:
-                inputs, targets = inputs.cuda("cuda:3"), targets.cuda("cuda:3", non_blocking=True)
+                inputs, targets = inputs.cuda(), targets.cuda(non_blocking=True)
             else:       
-                inputs, targets = inputs.cuda("cuda:2"), targets.cuda("cuda:2", non_blocking=True)
+                inputs, targets = inputs.cuda(), targets.cuda(non_blocking=True)
 
         # compute output
-        cuda_p2p.cudaSync()
+        # cuda_p2p.cudaSync()
         outputs = model(inputs)
+        # with torch.cuda.profiler.profile(use_cuda=True) as prof:
+        #     outputs = model(inputs)
+        # print(prof)
         loss = criterion(outputs, targets)
 
         # measure accuracy and record loss
@@ -323,17 +329,17 @@ def train(trainloader, model, criterion, optimizer, epoch, use_cuda):
         top5.update(prec5.item(), inputs.size(0))
 
         # compute gradient and do SGD step
-        cuda_p2p.cudaSync()
+        # cuda_p2p.cudaSync()
         optimizer.zero_grad()
 
         #pdb.set_trace()
 
-        cuda_p2p.cudaSync()
+        # cuda_p2p.cudaSync()
         loss.backward()
-        cuda_p2p.cudaSync()
+        # cuda_p2p.cudaSync()
 
         optimizer.step()
-        cuda_p2p.cudaSync()
+        # cuda_p2p.cudaSync()
         #print(list(model.classifier.weight)[0][:10])
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -374,7 +380,7 @@ def test(testloader, model, criterion, epoch, use_cuda):
         data_time.update(time.time() - end)
 
         if use_cuda:
-            inputs, targets = inputs.cuda("cuda:2"), targets.cuda("cuda:2")
+            inputs, targets = inputs.cuda(), targets.cuda()
         inputs, targets = torch.autograd.Variable(inputs, volatile=True), torch.autograd.Variable(targets)
 
         # compute output
